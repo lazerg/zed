@@ -70,6 +70,8 @@ use serde::Deserialize;
 use settings::{GitDiffBaseSetting, Settings, SettingsLocation, SettingsStore, WorktreeId};
 use smallvec::SmallVec;
 use smol::future::yield_now;
+#[cfg(unix)]
+use std::os::unix::fs::FileTypeExt as _;
 use std::{
     cell::RefCell,
     cmp::Ordering,
@@ -10880,6 +10882,9 @@ pub async fn resolve_git_worktree_to_main_repo(fs: &dyn Fs, path: &Path) -> Opti
     if metadata.is_dir {
         return None; // Normal repo, not a linked worktree
     }
+    if metadata.is_fifo {
+        return None;
+    }
     // It's a .git file — parse the gitdir: pointer
     let content = fs.load(&dot_git).await.ok()?;
     let gitdir_rel = content.strip_prefix("gitdir:")?.trim();
@@ -10891,7 +10896,11 @@ pub async fn resolve_git_worktree_to_main_repo(fs: &dyn Fs, path: &Path) -> Opti
         return None;
     }
     // Read commondir to find the main .git directory
-    let commondir_content = fs.load(&gitdir_abs.join("commondir")).await.ok()?;
+    let commondir_abs_path = gitdir_abs.join("commondir");
+    if is_fifo(fs, &commondir_abs_path).await {
+        return None;
+    }
+    let commondir_content = fs.load(&commondir_abs_path).await.ok()?;
     let common_dir = fs
         .canonicalize(&gitdir_abs.join(commondir_content.trim()))
         .await
@@ -11142,6 +11151,30 @@ fn is_numbered_mount_name(name: &str) -> bool {
     })
 }
 
+#[cfg(unix)]
+async fn is_fifo(fs: &dyn Fs, path: &Path) -> bool {
+    fs.metadata(path)
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|metadata| metadata.is_fifo)
+}
+
+#[cfg(not(unix))]
+async fn is_fifo(_fs: &dyn Fs, _path: &Path) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn is_fifo_path(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|metadata| metadata.file_type().is_fifo())
+}
+
+#[cfg(not(unix))]
+fn is_fifo_path(_path: &Path) -> bool {
+    false
+}
+
 fn get_permalink_in_rust_registry_src(
     provider_registry: Arc<GitHostingProviderRegistry>,
     path: PathBuf,
@@ -11169,13 +11202,21 @@ fn get_permalink_in_rust_registry_src(
     }
 
     let Some((dir, cargo_vcs_info_json)) = path.ancestors().skip(1).find_map(|dir| {
-        let json = std::fs::read_to_string(dir.join(".cargo_vcs_info.json")).ok()?;
+        let json_path = dir.join(".cargo_vcs_info.json");
+        if is_fifo_path(&json_path) {
+            return None;
+        }
+        let json = std::fs::read_to_string(json_path).ok()?;
         Some((dir, json))
     }) else {
         bail!("No .cargo_vcs_info.json found in parent directories")
     };
     let cargo_vcs_info = serde_json::from_str::<CargoVcsInfo>(&cargo_vcs_info_json)?;
-    let cargo_toml = std::fs::read_to_string(dir.join("Cargo.toml"))?;
+    let cargo_toml_path = dir.join("Cargo.toml");
+    if is_fifo_path(&cargo_toml_path) {
+        bail!("{} is a FIFO", cargo_toml_path.display());
+    }
+    let cargo_toml = std::fs::read_to_string(cargo_toml_path)?;
     let manifest = toml::from_str::<CargoToml>(&cargo_toml)?;
     let (provider, remote) = parse_git_remote_url(provider_registry, &manifest.package.repository)
         .context("parsing package.repository field of manifest")?;
@@ -11555,6 +11596,9 @@ async fn append_pattern_to_ignore_file(
     file_path: PathBuf,
     pattern: String,
 ) -> Result<()> {
+    if is_fifo(fs.as_ref(), &file_path).await {
+        bail!("{} is a FIFO", file_path.display());
+    }
     let existing_content = match fs.load(&file_path).await {
         Ok(content) => content,
         Err(error)

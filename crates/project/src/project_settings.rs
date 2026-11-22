@@ -1341,7 +1341,11 @@ impl SettingsObserver {
 
             let removed = change == &PathChange::Removed;
             let fs = fs.clone();
-            let abs_path = worktree.read(cx).absolutize(path);
+            let worktree = worktree.read(cx);
+            let is_fifo = worktree
+                .entry_for_path(path)
+                .is_some_and(|entry| entry.is_fifo);
+            let abs_path = worktree.absolutize(path);
             settings_contents.push(async move {
                 (
                     settings_dir,
@@ -1351,6 +1355,7 @@ impl SettingsObserver {
                     } else {
                         Some(
                             async move {
+                                anyhow::ensure!(!is_fifo, "{abs_path:?} is a FIFO");
                                 let content = fs.load(&abs_path).await?;
                                 if abs_path.ends_with(local_vscode_tasks_file_relative_path().as_std_path()) {
                                     let vscode_tasks =

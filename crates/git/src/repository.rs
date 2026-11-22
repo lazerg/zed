@@ -42,6 +42,9 @@ use util::rel_path::RelPath;
 use util::{ResultExt, paths};
 use uuid::Uuid;
 
+#[cfg(unix)]
+use std::os::unix::fs::FileTypeExt as _;
+
 pub use askpass::{AskPassDelegate, AskPassResult, AskPassSession};
 
 pub const REMOTE_CANCELLED_BY_USER: &str = "Operation cancelled by user";
@@ -82,6 +85,11 @@ pub fn original_repo_path_from_common_dir(common_dir: &Path) -> Option<PathBuf> 
 
 fn linked_worktree_git_dir(worktree_path: &Path) -> Result<PathBuf> {
     let dot_git_path = worktree_path.join(".git");
+    anyhow::ensure!(
+        !is_fifo(&dot_git_path),
+        "{} is a FIFO",
+        dot_git_path.display()
+    );
     let git_file = std::fs::read_to_string(&dot_git_path)
         .with_context(|| format!("failed to read {}", dot_git_path.display()))?;
     let git_dir = git_file
@@ -89,6 +97,16 @@ fn linked_worktree_git_dir(worktree_path: &Path) -> Result<PathBuf> {
         .context("worktree .git file missing gitdir pointer")?
         .trim();
     Ok(worktree_path.join(git_dir))
+}
+
+#[cfg(unix)]
+fn is_fifo(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|metadata| metadata.file_type().is_fifo())
+}
+
+#[cfg(not(unix))]
+fn is_fifo(_path: &Path) -> bool {
+    false
 }
 
 fn normalize_git_metadata_path(path: PathBuf) -> Result<PathBuf> {
@@ -620,6 +638,14 @@ async fn load_commit_object<R: smol::io::AsyncBufRead + Unpin>(
 }
 
 async fn read_shallow_file(shallow_file_path: &Path) -> Result<Option<String>> {
+    #[cfg(unix)]
+    anyhow::ensure!(
+        !smol::fs::metadata(shallow_file_path)
+            .await
+            .is_ok_and(|metadata| metadata.file_type().is_fifo()),
+        "{} is a FIFO",
+        shallow_file_path.display()
+    );
     match smol::fs::read_to_string(shallow_file_path).await {
         Ok(contents) => Ok(Some(contents)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -1651,7 +1677,15 @@ impl GitRepository for RealGitRepository {
                 let path = if let Some(path) = raw_path.strip_prefix("~/") {
                     paths::home_dir().join(path)
                 } else if path.is_relative() {
-                    working_directory.join(path)
+                    let path = working_directory.join(path);
+                    if is_fifo(&path) {
+                        log::warn!(
+                            "failed to read commit template {}: it is a FIFO",
+                            path.display()
+                        );
+                        return Ok(None);
+                    }
+                    path
                 } else {
                     path
                 };
@@ -1879,7 +1913,13 @@ impl GitRepository for RealGitRepository {
     fn merge_message(&self) -> BoxFuture<'_, Option<String>> {
         let path = self.path().join("MERGE_MSG");
         self.executor
-            .spawn(async move { std::fs::read_to_string(&path).ok() })
+            .spawn(async move {
+                if is_fifo(&path) {
+                    None
+                } else {
+                    std::fs::read_to_string(&path).ok()
+                }
+            })
             .boxed()
     }
 
